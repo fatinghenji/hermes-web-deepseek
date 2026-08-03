@@ -1,0 +1,9 @@
+name: web-deepseek
+version: 1.1.0
+description: "DeepSeek 原生联网搜索 — server-side web_search via DeepSeek's Anthropic-compatible endpoint. Requires DEEPSEEK_API_KEY."
+author: fatinghenji
+kind: backend
+provides_web_providers:
+  - deepseek
+requires_env:
+  - DEEPSEEK_API_KEY
