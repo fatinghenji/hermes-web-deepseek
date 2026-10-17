@@ -1,6 +1,6 @@
 name: web-deepseek
-version: 1.1.0
-description: "DeepSeek 原生联网搜索 — server-side web_search via DeepSeek's Anthropic-compatible endpoint. Requires DEEPSEEK_API_KEY."
+version: 2.0.0
+description: "DeepSeek 官方 Search/Fetch API — raw JSON web search + page fetch, per-call pricing (5元/千次). Requires DEEPSEEK_API_KEY."
 author: fatinghenji
 kind: backend
 provides_web_providers:

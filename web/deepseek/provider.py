@@ -1,19 +1,21 @@
 """DeepSeek Web Search — standalone Hermes web backend plugin.
 
-Routes ``web_search`` tool calls through DeepSeek's server-side
-``web_search`` tool on the Anthropic-compatible endpoint
-(``https://api.deepseek.com/anthropic``). DeepSeek runs the actual
-searching and page-reading server-side (usage reports
-``server_tool_use.web_search_requests``); the final assistant text block
-is a server-side synthesis of the fetched pages, which we surface to the
-main model as ``data.summary`` alongside the standard ``data.web`` rows.
+Routes ``web_search`` / ``web_extract`` through DeepSeek's raw Search and
+Fetch APIs (``POST https://api.deepseek.com/v1/tools/search`` and
+``/v1/tools/fetch``). These are plain JSON APIs — no LLM call, no
+server-side synthesis — billed per request (5 CNY / 1000 successful calls,
+empty results free), not per token. Search results carry ``rerank_score``,
+``authority`` and ``date`` metadata that LLM-synthesized search does not.
 
-Reference: DeepSeek API docs — "Integrate with Agent Tools" / Web Search
-via the Anthropic endpoint. Tool declaration:
-``{"type": "web_search_20250305", "name": "web_search"}``.
+Reference: https://api-docs.deepseek.com/zh-cn/guides/search/
 
-Install: see README.md — ``install.sh`` copies ``web/deepseek/`` into
-``~/.hermes/plugins/``; then ``hermes plugins enable web-deepseek``.
+Replaces the v1 implementation, which piggybacked the Anthropic-compatible
+endpoint's server-side ``web_search_20250305`` tool (per-token billing,
+opaque result set). That path starts metered billing on 2026-11-01 on top
+of token cost — the raw API is strictly cheaper and fully controllable.
+
+Install: ``hermes plugins enable web-deepseek``, then
+``hermes config set web.search_backend deepseek``.
 
 Config keys this provider responds to::
 
@@ -25,21 +27,13 @@ Optional knobs (under ``web.deepseek`` in ``config.yaml``)::
 
     web:
       deepseek:
-        model: "deepseek-v4-flash"  # default deepseek-v4-flash
-        base_url: "https://api.deepseek.com/anthropic"
-        max_tokens: 1024            # cap on the synthesis text
-        timeout: 120                # seconds (default 120)
+        base_url: "https://api.deepseek.com"
+        timeout: 60                 # seconds per HTTP call
+        need_content: false         # true = search returns page bodies too
+                                    # (heavier responses, same price)
 
 Auth: ``DEEPSEEK_API_KEY``, resolved via :func:`get_provider_env` (checks
 ``os.environ`` first, then ``~/.hermes/.env``).
-
-Trust model
------------
-Like the bundled xAI backend, this is an LLM in a trench coat: DeepSeek
-decides which URLs to surface and writes the titles itself, influenced by
-the *content of the query*. Callers that pipe untrusted text directly
-into ``web_search`` should treat returned URLs as model-generated links —
-validate before fetching.
 """
 
 from __future__ import annotations
@@ -51,15 +45,9 @@ from agent.web_search_provider import WebSearchProvider, get_provider_env
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "deepseek-v4-flash"
-DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic"
-DEFAULT_MAX_TOKENS = 1024
-DEFAULT_TIMEOUT = 120
-
-# Anthropic server-side web search tool, as implemented by DeepSeek's
-# Anthropic-compatible endpoint. Verified live: without the ``name`` field
-# the endpoint rejects the request ("missing field `name`").
-SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_TIMEOUT = 60
+MAX_COUNT = 50  # API hard limit: count must be 1..50
 
 
 def _load_cfg() -> Dict[str, Any]:
@@ -77,11 +65,7 @@ def _load_cfg() -> Dict[str, Any]:
 
 
 class DeepSeekWebSearchProvider(WebSearchProvider):
-    """Search-only provider backed by DeepSeek's server-side web search.
-
-    No extract capability — pair with Firecrawl / Tavily / Exa for
-    ``web_extract`` if you need raw page content.
-    """
+    """Search + extract provider backed by DeepSeek's raw Search/Fetch APIs."""
 
     @property
     def name(self) -> str:
@@ -89,7 +73,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
 
     @property
     def display_name(self) -> str:
-        return "DeepSeek Web Search (原生联网搜索)"
+        return "DeepSeek Search API (官方搜索接口)"
 
     def is_available(self) -> bool:
         """Cheap availability probe — DEEPSEEK_API_KEY present.
@@ -104,81 +88,36 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
         return True
 
     def supports_extract(self) -> bool:
-        return False
+        return True
 
-    # -- Search -----------------------------------------------------------
+    # -- Shared HTTP --------------------------------------------------------
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
-        """Execute a DeepSeek-native web search.
-
-        Returns ``{"success": True, "data": {"web": [{title, url,
-        description, position}, ...], "summary": str}}`` on success,
-        ``{"success": False, "error": str}`` on failure.
-
-        ``data.summary`` is DeepSeek's own synthesis of the searched pages
-        — the main model gets the search-engine rows *and* the server-side
-        summary, which is what makes this backend feel like Claude Code's
-        Web Search.
-        """
+    def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST to the tools API; returns parsed JSON or raises RuntimeError."""
         api_key = get_provider_env("DEEPSEEK_API_KEY")
         if not api_key:
-            return {
-                "success": False,
-                "error": (
-                    "No DEEPSEEK_API_KEY found. Set it in ~/.hermes/.env "
-                    "or export it in the environment."
-                ),
-            }
-
-        # Clamp limit to the range the caller (web_search_tool) accepts.
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 5
-        limit = max(1, min(limit, 100))
+            raise RuntimeError(
+                "No DEEPSEEK_API_KEY found. Set it in ~/.hermes/.env "
+                "or export it in the environment."
+            )
 
         cfg = _load_cfg()
-        model = str(cfg.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         base_url = str(cfg.get("base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
         base_url = base_url or DEFAULT_BASE_URL
-        try:
-            max_tokens = int(cfg.get("max_tokens", DEFAULT_MAX_TOKENS))
-        except (TypeError, ValueError):
-            max_tokens = DEFAULT_MAX_TOKENS
         try:
             timeout = float(cfg.get("timeout", DEFAULT_TIMEOUT))
         except (TypeError, ValueError):
             timeout = DEFAULT_TIMEOUT
 
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": query}],
-            "tools": [SEARCH_TOOL],
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        }
-
-        try:
-            import httpx
-        except ImportError:
-            return {
-                "success": False,
-                "error": "httpx is not installed (required for DeepSeek web search)",
-            }
-
-        logger.info(
-            "DeepSeek web search via %s: '%s' (limit=%d, model=%s)",
-            base_url, query, limit, model,
-        )
+        import httpx
 
         try:
             resp = httpx.post(
-                f"{base_url}/v1/messages",
-                headers=headers,
+                f"{base_url}{path}",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
                 json=payload,
                 timeout=timeout,
             )
@@ -190,88 +129,116 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                 body = exc.response.text[:300] if exc.response is not None else ""
             except Exception:  # noqa: BLE001
                 body = ""
-            logger.warning("DeepSeek web search HTTP %d: %s", status, body)
-            return {
-                "success": False,
-                "error": f"DeepSeek web search returned HTTP {status}: {body}".rstrip(),
-            }
+            raise RuntimeError(f"DeepSeek {path} returned HTTP {status}: {body}".rstrip())
         except httpx.RequestError as exc:
-            logger.warning("DeepSeek web search request error: %s", exc)
-            return {"success": False, "error": f"Could not reach DeepSeek: {exc}"}
+            raise RuntimeError(f"Could not reach DeepSeek: {exc}")
 
         try:
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("DeepSeek web search bad JSON: %s", exc)
-            return {
-                "success": False,
-                "error": "Could not parse DeepSeek reply as JSON",
-            }
+            raise RuntimeError(f"Could not parse DeepSeek reply as JSON: {exc}")
+        if not isinstance(data, dict):
+            raise RuntimeError("DeepSeek reply was not a JSON object")
+        return data
 
-        results, summary = self._parse_reply(data)
-        envelope: Dict[str, Any] = {"web": results[:limit], "summary": summary}
+    # -- Search -------------------------------------------------------------
+
+    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+        """Execute a DeepSeek Search API query.
+
+        Returns ``{"success": True, "data": {"web": [{title, url,
+        description, position}, ...]}}``. ``description`` carries the API's
+        long ``summary`` field (600-800 chars, written for model consumption),
+        falling back to ``snippet``.
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(limit, MAX_COUNT))
+
+        cfg = _load_cfg()
+        need_content = bool(cfg.get("need_content", False))
+
+        logger.info("DeepSeek search API: '%s' (count=%d)", query, limit)
+
+        try:
+            data = self._post(
+                "/v1/tools/search",
+                {"query": query, "count": limit, "need_content": need_content},
+            )
+        except RuntimeError as exc:
+            logger.warning("DeepSeek search failed: %s", exc)
+            return {"success": False, "error": str(exc)}
+
+        results: List[Dict[str, Any]] = []
+        for item in data.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+            description = str(item.get("summary") or item.get("snippet") or "").strip()
+            row: Dict[str, Any] = {
+                "title": str(item.get("title", "")).strip(),
+                "url": url,
+                "description": description,
+                "position": len(results) + 1,
+            }
+            if need_content and item.get("content"):
+                row["content"] = str(item["content"])
+            results.append(row)
+
+        envelope: Dict[str, Any] = {"web": results}
         return {"success": True, "data": envelope}
 
-    # -- Parsing ----------------------------------------------------------
+    # -- Extract ------------------------------------------------------------
 
-    @classmethod
-    def _parse_reply(cls, data: Any) -> tuple[List[Dict[str, Any]], str]:
-        """Walk ``content`` blocks for search rows and the synthesis text.
+    def extract(self, urls: List[str], **kwargs: Any) -> Dict[str, Any]:
+        """Fetch pages via the DeepSeek Fetch API (one call per URL).
 
-        Block types seen in the wild (DeepSeek Anthropic endpoint):
-        ``thinking``, ``server_tool_use`` (search calls), ``text`` (final
-        synthesis), and ``web_search_tool_result`` whose ``content`` holds
-        ``web_search_result`` items with ``title`` / ``url`` /
-        ``encrypted_content`` / ``page_age``. Only title+url are usable
-        client-side; the page content lives inside the server.
+        Returns ``{"success": True, "data": [{"url", "title", "content",
+        "raw_content", "metadata"}, ...]}``; per-URL failures are skipped and
+        logged, and only an across-the-board failure flips ``success``.
         """
-        results: List[Dict[str, Any]] = []
-        summary_parts: List[str] = []
-        if not isinstance(data, dict):
-            return results, ""
-        content = data.get("content")
-        if not isinstance(content, list):
-            return results, "\n".join(summary_parts)
-
-        for block in content:
-            if not isinstance(block, dict):
+        data_rows: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for url in urls:
+            url = str(url).strip()
+            if not url:
                 continue
-            btype = block.get("type")
-            if btype == "web_search_tool_result":
-                items = block.get("content")
-                if not isinstance(items, list):
-                    continue
-                for item in items:
-                    if not isinstance(item, dict) or item.get("type") != "web_search_result":
-                        continue
-                    url = str(item.get("url", "")).strip()
-                    if not url:
-                        continue
-                    results.append(
-                        {
-                            "title": str(item.get("title", "")).strip(),
-                            "url": url,
-                            "description": "",
-                            # Renumber from kept rows so a dropped malformed
-                            # item leaves no gap in positions.
-                            "position": len(results) + 1,
-                        }
-                    )
-            elif btype == "text":
-                text = str(block.get("text", "")).strip()
-                if text:
-                    summary_parts.append(text)
+            try:
+                page = self._post("/v1/tools/fetch", {"url": url})
+            except RuntimeError as exc:
+                logger.warning("DeepSeek fetch failed for %s: %s", url, exc)
+                errors.append(f"{url}: {exc}")
+                continue
+            content = str(page.get("content") or "")
+            data_rows.append(
+                {
+                    "url": url,
+                    "title": str(page.get("title") or ""),
+                    "content": content,
+                    "raw_content": content,
+                    "metadata": {},
+                }
+            )
 
-        return results, "\n".join(summary_parts)
+        if not data_rows:
+            return {
+                "success": False,
+                "error": "DeepSeek fetch failed for all URLs: " + "; ".join(errors),
+            }
+        return {"success": True, "data": data_rows}
 
-    # -- hermes tools picker ----------------------------------------------
+    # -- hermes tools picker ------------------------------------------------
 
     def get_setup_schema(self) -> Dict[str, Any]:
         """Expose the API-key prompt in the ``hermes tools`` picker."""
         return {
-            "name": "DeepSeek Web Search",
+            "name": "DeepSeek Search API",
             "badge": "paid",
-            "tag": "Server-side web search via DeepSeek's Anthropic-compatible endpoint — per-token pricing.",
+            "tag": "DeepSeek 官方 Search/Fetch 接口 — 按次计费（5元/千次），非 token 计费。",
             "env_vars": [
                 {
                     "key": "DEEPSEEK_API_KEY",
