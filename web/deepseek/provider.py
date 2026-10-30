@@ -194,15 +194,16 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
 
     # -- Extract ------------------------------------------------------------
 
-    def extract(self, urls: List[str], **kwargs: Any) -> Dict[str, Any]:
+    def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Fetch pages via the DeepSeek Fetch API (one call per URL).
 
-        Returns ``{"success": True, "data": [{"url", "title", "content",
-        "raw_content", "metadata"}, ...]}``; per-URL failures are skipped and
-        logged, and only an across-the-board failure flips ``success``.
+        Returns the contract shape Hermes expects — a plain list, one row per
+        URL: ``{"url", "title", "content", "raw_content", "metadata"}`` on
+        success, ``{"url", "error"}`` on per-URL failure. (Base contract:
+        ``WebSearchProvider.extract``; a ``{"success", "data"}`` envelope makes
+        the caller iterate dict keys and blow up on ``'str' has no .get``.)
         """
-        data_rows: List[Dict[str, Any]] = []
-        errors: List[str] = []
+        rows: List[Dict[str, Any]] = []
         for url in urls:
             url = str(url).strip()
             if not url:
@@ -211,10 +212,10 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                 page = self._post("/v1/tools/fetch", {"url": url})
             except RuntimeError as exc:
                 logger.warning("DeepSeek fetch failed for %s: %s", url, exc)
-                errors.append(f"{url}: {exc}")
+                rows.append({"url": url, "error": str(exc)})
                 continue
             content = str(page.get("content") or "")
-            data_rows.append(
+            rows.append(
                 {
                     "url": url,
                     "title": str(page.get("title") or ""),
@@ -223,13 +224,7 @@ class DeepSeekWebSearchProvider(WebSearchProvider):
                     "metadata": {},
                 }
             )
-
-        if not data_rows:
-            return {
-                "success": False,
-                "error": "DeepSeek fetch failed for all URLs: " + "; ".join(errors),
-            }
-        return {"success": True, "data": data_rows}
+        return rows
 
     # -- hermes tools picker ------------------------------------------------
 

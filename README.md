@@ -9,7 +9,7 @@ DeepSeek Search/Fetch API plugin for [Hermes Agent](https://hermes-agent.nousres
 - **Structured results** — every row carries `rerank_score` (0–3), `authority` (0–4) and a UTC `date`; the provider surfaces the API's long `summary` field (600–800 chars, written for model consumption) as each row's `description`
 - **Full query syntax** — `site:` / `-site:` / `after:` / `before:` / `lang:` / `"exact phrase"` all passed through to the engine
 - **Optional inline content** — set `web.deepseek.need_content: true` and search results include full page bodies at no extra charge
-- **Extract support** — `supports_extract()` via the Fetch API (one call per URL, per-URL failures skipped)
+- **Extract support** — `supports_extract()` via the Fetch API (one call per URL; a failed URL comes back as a `{"url", "error"}` row, never a silent drop)
 - **Reuses the inference credential** — no new env vars beyond `DEEPSEEK_API_KEY`
 - **`hermes tools` integration** — `get_setup_schema()` shows the DeepSeek row with the API-key prompt
 
